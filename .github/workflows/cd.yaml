@@ -1,0 +1,245 @@
+name: Push code to Lambda
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  update-backend-layer:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.14"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Check if backend dependencies changed
+        id: check_backend
+        run: |
+          NEW_HASH=$(sha256sum requirements.txt | cut -d' ' -f1)
+          echo "new_hash=$NEW_HASH" >> $GITHUB_OUTPUT
+          OLD_HASH=$(aws s3 cp s3://revmate-storage/lambda-layers/backend_requirements_hash.txt - 2>/dev/null || echo "none")
+          echo "old_hash=$OLD_HASH" >> $GITHUB_OUTPUT
+          if [ "$NEW_HASH" = "$OLD_HASH" ]; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and update backend layer
+        if: steps.check_backend.outputs.changed == 'true'
+        run: |
+          mkdir -p layer/python
+          pip install -r requirements.txt -t layer/python
+          cd layer && zip -r ../backend_layer.zip .
+
+          aws s3 cp ../backend_layer.zip s3://revmate-storage/lambda-layers/backend_layer.zip
+
+          LAYER_ARN=$(aws lambda publish-layer-version \
+            --layer-name dependenciesBackend \
+            --content S3Bucket=revmate-storage,S3Key=lambda-layers/backend_layer.zip \
+            --compatible-runtimes python3.14 \
+            --query 'LayerVersionArn' \
+            --output text)
+
+          aws lambda update-function-configuration \
+            --function-name carBackend \
+            --layers $LAYER_ARN
+
+          aws lambda wait function-updated \
+            --function-name carBackend
+
+          echo "${{ steps.check_backend.outputs.new_hash }}" | \
+            aws s3 cp - s3://revmate-storage/lambda-layers/backend_requirements_hash.txt
+
+      - name: Clean up old backend layer versions
+        if: steps.check_backend.outputs.changed == 'true'
+        run: |
+          OLD_VERSIONS=$(aws lambda list-layer-versions \
+            --layer-name dependenciesBackend \
+            --query 'LayerVersions[1:].Version' \
+            --output text)
+          for VERSION in $OLD_VERSIONS; do
+            aws lambda delete-layer-version \
+              --layer-name dependenciesBackend \
+              --version-number $VERSION
+            echo "Deleted backend layer version $VERSION"
+          done
+
+  update-ai-layer:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.14"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Check if AI dependencies changed
+        id: check_ai
+        run: |
+          NEW_HASH=$(sha256sum ai_service/requirements.txt | cut -d' ' -f1)
+          echo "new_hash=$NEW_HASH" >> $GITHUB_OUTPUT
+          OLD_HASH=$(aws s3 cp s3://revmate-storage/lambda-layers/ai_requirements_hash.txt - 2>/dev/null || echo "none")
+          echo "old_hash=$OLD_HASH" >> $GITHUB_OUTPUT
+          if [ "$NEW_HASH" = "$OLD_HASH" ]; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and update AI layer
+        if: steps.check_ai.outputs.changed == 'true'
+        run: |
+          mkdir -p ai_layer/python
+          pip install -r ai_service/requirements.txt -t ai_layer/python
+          cd ai_layer && zip -r ../ai_layer.zip .
+
+          aws s3 cp ../ai_layer.zip s3://revmate-storage/lambda-layers/ai_layer.zip
+
+          LAYER_ARN=$(aws lambda publish-layer-version \
+            --layer-name dependenciesAI \
+            --content S3Bucket=revmate-storage,S3Key=lambda-layers/ai_layer.zip \
+            --compatible-runtimes python3.14 \
+            --query 'LayerVersionArn' \
+            --output text)
+
+          aws lambda update-function-configuration \
+            --function-name aiService \
+            --layers $LAYER_ARN
+
+          aws lambda wait function-updated \
+            --function-name aiService
+
+          echo "${{ steps.check_ai.outputs.new_hash }}" | \
+            aws s3 cp - s3://revmate-storage/lambda-layers/ai_requirements_hash.txt
+
+      - name: Clean up old AI layer versions
+        if: steps.check_ai.outputs.changed == 'true'
+        run: |
+          OLD_VERSIONS=$(aws lambda list-layer-versions \
+            --layer-name dependenciesAI \
+            --query 'LayerVersions[1:].Version' \
+            --output text)
+          for VERSION in $OLD_VERSIONS; do
+            aws lambda delete-layer-version \
+              --layer-name dependenciesAI \
+              --version-number $VERSION
+            echo "Deleted AI layer version $VERSION"
+          done
+
+  update-lambda:
+    runs-on: ubuntu-latest
+    needs: update-backend-layer
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.14"
+
+      - name: Zip Lambda function
+        run: |
+          zip -r function.zip . \
+            --exclude "ai_service/*" \
+            --exclude "email_service/*" \
+            --exclude "tests/*" \
+            --exclude "pytest.ini" \
+            --exclude "requirements-test.txt"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update Lambda code
+        run: |
+          aws lambda wait function-updated \
+            --function-name carBackend
+
+          aws lambda update-function-code \
+            --function-name carBackend \
+            --zip-file fileb://function.zip \
+            --query 'FunctionArn' \
+            --output text
+
+  update-ai-lambda:
+    runs-on: ubuntu-latest
+    needs: update-ai-layer
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy AI Lambda code
+        run: |
+          cd ai_service
+          zip -r ../ai_function.zip *.py
+          cd ..
+
+          aws lambda wait function-updated \
+            --function-name aiService
+
+          aws lambda update-function-code \
+            --function-name aiService \
+            --zip-file fileb://ai_function.zip \
+            --query 'FunctionArn' \
+            --output text
+
+  update-email-lambda:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy Email Lambda code
+        run: |
+          cd email_service
+          zip -r ../email_function.zip *.py
+          cd ..
+
+          aws lambda wait function-updated \
+            --function-name emailService
+
+          aws lambda update-function-code \
+            --function-name emailService \
+            --zip-file fileb://email_function.zip \
+            --query 'FunctionArn' \
+            --output text
